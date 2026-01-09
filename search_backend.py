@@ -4,18 +4,15 @@ import math
 import pickle
 import re
 from collections import Counter, defaultdict
-from contextlib import closing
-from typing import Dict, List, Tuple
+from functools import lru_cache
+from typing import Dict, List, Tuple, Iterable, Optional
 
 import numpy as np
 from google.cloud import storage
 
-# comes from staff code / your file
-from inverted_index_gcp import MultiFileReader
-
 
 # --- Minimal (embedded) English stopwords set (based on common NLTK list) ---
-# (No nltk.download needed; safe on GCP)
+# (No nltk.download needed)
 ENGLISH_STOPWORDS = frozenset({
     "i","me","my","myself","we","our","ours","ourselves","you","your","yours","yourself","yourselves",
     "he","him","his","himself","she","her","hers","herself","it","its","itself","they","them","their",
@@ -41,19 +38,78 @@ ALL_STOPWORDS = ENGLISH_STOPWORDS.union(CORPUS_STOPWORDS)
 # Token pattern (similar spirit to staff solutions)
 RE_WORD = re.compile(r"""[\#\@\w](['\-]?\w){2,24}""", re.UNICODE)
 
+# In staff code inverted_index_gcp.py:
+# BLOCK_SIZE = 1999998, TUPLE_SIZE=6 (doc_id 4 bytes + tf 2 bytes)
+BLOCK_SIZE = 1999998
+TUPLE_SIZE = 6
+
+
+class GCSMultiFileReader:
+    """
+    Reads byte ranges from multiple GCS objects given locs=[(file_name, offset), ...].
+    Handles cases where file_name already includes the base_dir prefix.
+    """
+
+    def __init__(self, bucket_name: str, base_dir: str):
+        self.bucket_name = bucket_name
+        self.base_dir = base_dir.strip("/")
+
+        self._client = storage.Client()
+        self._bucket = self._client.bucket(bucket_name)
+
+    def _normalize_blob_name(self, f_name: str) -> str:
+        f_name = f_name.lstrip("/")
+        if self.base_dir == "":
+            return f_name
+        # If already starts with base_dir, don't double-prepend
+        if f_name.startswith(self.base_dir + "/") or f_name == self.base_dir:
+            return f_name
+        return f"{self.base_dir}/{f_name}"
+
+    def read(self, locs: Iterable[Tuple[str, int]], n_bytes: int) -> bytes:
+        chunks = []
+        remaining = n_bytes
+
+        for f_name, offset in locs:
+            if remaining <= 0:
+                break
+
+            blob_name = self._normalize_blob_name(str(f_name))
+            blob = self._bucket.blob(blob_name)
+
+            # staff logic: n_read = min(remaining, BLOCK_SIZE - offset)
+            n_read = min(remaining, BLOCK_SIZE - int(offset))
+            if n_read <= 0:
+                continue
+
+            # download byte range [start, end] inclusive
+            start = int(offset)
+            end = start + n_read - 1
+            data = blob.download_as_bytes(start=start, end=end)
+
+            chunks.append(data)
+            remaining -= len(data)
+
+        return b"".join(chunks)
+
 
 class SearchEngine:
     """
     Minimal backend:
-      - TF-IDF cosine similarity over body index stored on GCS.
+      - TF-IDF cosine similarity over BODY inverted index stored on GCS.
       - returns [(wiki_id, title), ...] up to top_k.
+
+    Expected GCS objects (your current setup):
+      - body_index_pkl_path: "postings_gcp/index.pkl"
+      - posting bin files under: "postings_gcp/....bin"
+      - title_dict_pkl_path: "doc_title_dic.pickle"
     """
 
     def __init__(
         self,
         bucket_name: str,
-        body_index_pkl_path: str = "body1/body1_index.pkl",
-        body_bins_folder: str = "body1",
+        body_index_pkl_path: str = "postings_gcp/index.pkl",
+        body_bins_folder: str = "postings_gcp",
         title_dict_pkl_path: str = "doc_title_dic.pickle",
     ):
         self.bucket_name = bucket_name
@@ -67,9 +123,15 @@ class SearchEngine:
         self.doc_title_dic = self._load_pickle_from_gcs(self.title_dict_pkl_path)
         self.index_body = self._load_pickle_from_gcs(self.body_index_pkl_path)
 
-        # sanity (helps catch wrong object / wrong file early)
+        # sanity checks
         if not hasattr(self.index_body, "df") or not hasattr(self.index_body, "posting_locs"):
             raise ValueError("Loaded body index object doesn't look like an inverted index (df/posting_locs missing).")
+        if not hasattr(self.index_body, "N"):
+            raise ValueError("Loaded body index is missing attribute N (needed for IDF).")
+        if not hasattr(self.index_body, "weights"):
+            raise ValueError("Loaded body index is missing attribute weights (needed for doc_len/doc_norm).")
+
+        self._reader = GCSMultiFileReader(bucket_name=self.bucket_name, base_dir=self.body_bins_folder)
 
     # ------------------------- Public API -------------------------
 
@@ -85,9 +147,7 @@ class SearchEngine:
         if not query_tfidf:
             return []
 
-        # Build numerator (dot product) per doc via postings
         doc_numerators = self._get_candidate_docs_body(tokens, query_tfidf)
-
         if not doc_numerators:
             return []
 
@@ -95,23 +155,22 @@ class SearchEngine:
         if not scores:
             return []
 
-        # Top-k by score
         top = sorted(scores.items(), key=lambda x: x[1], reverse=True)[:top_k]
 
-        # Map to titles
         res: List[Tuple[int, str]] = []
         for doc_id, _score in top:
             title = self.doc_title_dic.get(doc_id)
             if title is not None:
-                res.append((doc_id, title))
+                res.append((int(doc_id), title))
         return res
 
-    # ------------------------- Core logic -------------------------
+    # ------------------------- Tokenization -------------------------
 
     def _tokenize(self, text: str) -> List[str]:
         tokens = [m.group().lower() for m in RE_WORD.finditer(text)]
-        tokens = [t for t in tokens if t not in ALL_STOPWORDS]
-        return tokens
+        return [t for t in tokens if t not in ALL_STOPWORDS]
+
+    # ------------------------- TF-IDF helpers -------------------------
 
     def _calc_query_tfidf(self, query_tokens: List[str], index) -> Dict[str, float]:
         """
@@ -122,70 +181,72 @@ class SearchEngine:
         if q_len == 0:
             return {}
 
+        N = index.N
         q_weights: Dict[str, float] = {}
-        N = getattr(index, "N", None)
-        if N is None:
-            # some implementations keep N elsewhere, but in staff index it exists
-            return {}
 
         for term in np.unique(query_tokens):
             df = index.df.get(term)
             if not df:
                 continue
             q_weights[term] = (q_tf[term] / q_len) * math.log(N / df)
+
         return q_weights
 
-    def _read_posting_list(self, index, term: str) -> List[Tuple[int, int]]:
+    @lru_cache(maxsize=25000)
+    def _read_posting_list(self, term: str) -> List[Tuple[int, int]]:
         """
         Reads posting list from GCS bins folder (self.body_bins_folder).
         Each posting entry encoded as 6 bytes: 4 bytes doc_id, 2 bytes tf.
         """
+        index = self.index_body
+
         if term not in index.posting_locs:
             return []
 
-        with closing(MultiFileReader(self.bucket_name, self.body_bins_folder)) as reader:
-            locs = index.posting_locs[term]
-            df = index.df.get(term, 0)
-            if df == 0:
-                return []
-            try:
-                b = reader.read(locs, df * 6, self.bucket_name)
-            except Exception:
-                return []
+        df = index.df.get(term, 0)
+        if df == 0:
+            return []
+
+        locs = index.posting_locs[term]
+        b = self._reader.read(locs, df * TUPLE_SIZE)
 
         posting_list: List[Tuple[int, int]] = []
         for i in range(df):
-            doc_id = int.from_bytes(b[i * 6:i * 6 + 4], "big")
-            tf = int.from_bytes(b[i * 6 + 4:(i + 1) * 6], "big")
+            start = i * TUPLE_SIZE
+            doc_id = int.from_bytes(b[start:start + 4], "big")
+            tf = int.from_bytes(b[start + 4:start + 6], "big")
             posting_list.append((doc_id, tf))
+
         return posting_list
 
     def _get_candidate_docs_body(self, query_tokens: List[str], query_tfidf: Dict[str, float]) -> Dict[int, float]:
         """
-        Builds the dot-product numerator for cosine similarity:
+        Builds dot-product numerator for cosine similarity:
             numerator(doc) += (tf/doc_len) * idf * q_tfidf(term)
-        Uses index.weights[doc_id][0] as doc_len (as in common staff solutions).
+
+        Assumes index.weights[doc_id][0] = doc_len
+                index.weights[doc_id][1] = doc_norm_sq   (or similar)
         """
         index = self.index_body
         N = index.N
 
         numerators: Dict[int, float] = defaultdict(float)
+
         for term in np.unique(query_tokens):
             df = index.df.get(term)
             if not df:
                 continue
 
-            idf = math.log(N / df)
             q_w = query_tfidf.get(term)
             if q_w is None:
                 continue
 
-            posting_list = self._read_posting_list(index, term)
+            idf = math.log(N / df)
+            posting_list = self._read_posting_list(term)
             if not posting_list:
                 continue
 
             for doc_id, tf in posting_list:
-                # doc length
                 try:
                     doc_len = index.weights[doc_id][0]
                 except Exception:
@@ -200,14 +261,13 @@ class SearchEngine:
     def _cosine_scores(self, numerators: Dict[int, float], query_tfidf: Dict[str, float]) -> Dict[int, float]:
         """
         cosine(doc, q) = numerator / (||doc|| * ||q||)
-        where doc norm is from index.weights[doc_id][1] (as in your friend's code),
-        and ||q|| from query weights.
+        where doc norm squared is assumed available at index.weights[doc_id][1]
         """
         index = self.index_body
+
         q_norm_sq = sum(w * w for w in query_tfidf.values())
         if q_norm_sq == 0:
             return {}
-
         q_norm = math.sqrt(q_norm_sq)
 
         scores: Dict[int, float] = {}
