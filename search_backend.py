@@ -207,12 +207,8 @@ class SearchEngine:
         if df == 0:
             return []
 
-        with closing(MultiFileReader(self.body_bins_folder, self.bucket_name)) as reader:
-            locs = index.posting_locs[term]
-            try:
-                b = reader.read(locs, df * 6)
-            except Exception:
-                return []
+        locs = index.posting_locs[term]
+        b = self._reader.read(locs, df * TUPLE_SIZE)  # TUPLE_SIZE=6
 
         posting_list: List[Tuple[int, int]] = []
         for i in range(df):
