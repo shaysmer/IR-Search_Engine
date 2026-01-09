@@ -4,12 +4,14 @@ import math
 import pickle
 import re
 from collections import Counter, defaultdict
+from contextlib import closing
 from functools import lru_cache
 from typing import Dict, List, Tuple, Iterable, Optional
 
 import numpy as np
 from google.cloud import storage
 
+from inverted_index_gcp import MultiFileReader
 
 # --- Minimal (embedded) English stopwords set (based on common NLTK list) ---
 # (No nltk.download needed)
@@ -193,13 +195,11 @@ class SearchEngine:
         return q_weights
 
     @lru_cache(maxsize=25000)
-    def _read_posting_list(self, term: str) -> List[Tuple[int, int]]:
+    def _read_posting_list(self, index, term: str) -> List[Tuple[int, int]]:
         """
         Reads posting list from GCS bins folder (self.body_bins_folder).
         Each posting entry encoded as 6 bytes: 4 bytes doc_id, 2 bytes tf.
         """
-        index = self.index_body
-
         if term not in index.posting_locs:
             return []
 
@@ -207,14 +207,17 @@ class SearchEngine:
         if df == 0:
             return []
 
-        locs = index.posting_locs[term]
-        b = self._reader.read(locs, df * TUPLE_SIZE)
+        with closing(MultiFileReader(self.body_bins_folder, self.bucket_name)) as reader:
+            locs = index.posting_locs[term]
+            try:
+                b = reader.read(locs, df * 6)
+            except Exception:
+                return []
 
         posting_list: List[Tuple[int, int]] = []
         for i in range(df):
-            start = i * TUPLE_SIZE
-            doc_id = int.from_bytes(b[start:start + 4], "big")
-            tf = int.from_bytes(b[start + 4:start + 6], "big")
+            doc_id = int.from_bytes(b[i * 6:i * 6 + 4], "big")
+            tf = int.from_bytes(b[i * 6 + 4:(i + 1) * 6], "big")
             posting_list.append((doc_id, tf))
 
         return posting_list
@@ -242,7 +245,7 @@ class SearchEngine:
                 continue
 
             idf = math.log(N / df)
-            posting_list = self._read_posting_list(term)
+            posting_list = self._read_posting_list(self.index_body, term)
             if not posting_list:
                 continue
 
