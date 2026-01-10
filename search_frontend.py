@@ -9,10 +9,14 @@ class MyFlaskApp(Flask):
 app = MyFlaskApp(__name__)
 app.config['JSONIFY_PRETTYPRINT_REGULAR'] = False
 
+
+bucket_name = "shay-208886382-bucket"
+file_path = "postings_gcp/index.pkl"
+
 #TODO: update our parameters from GCP bucket
 engine = SearchEngine(
-    bucket_name="shay-208886382-bucket",
-    body_index_pkl_path="postings_gcp/index.pkl",
+    bucket_name=bucket_name,
+    body_index_pkl_path=file_path,
     body_bins_folder="postings_gcp",
     title_dict_pkl_path="doc_title_dic.pickle"
 )
@@ -60,14 +64,16 @@ def search_body():
         list of up to 100 search results, ordered from best to worst where each 
         element is a tuple (wiki_id, title).
     '''
-    res = []
-    query = request.args.get('query', '')
-    if len(query) == 0:
-      return jsonify(res)
-    # BEGIN SOLUTION
+    pass
 
-    # END SOLUTION
-    return jsonify(res)
+    # res = []
+    # query = request.args.get('query', '')
+    # if len(query) == 0:
+    #   return jsonify(res)
+    # # BEGIN SOLUTION
+    #
+    # # END SOLUTION
+    # return jsonify(res)
 
 @app.route("/search_title")
 def search_title():
@@ -90,14 +96,15 @@ def search_title():
         list of ALL (not just top 100) search results, ordered from best to 
         worst where each element is a tuple (wiki_id, title).
     '''
-    res = []
-    query = request.args.get('query', '')
-    if len(query) == 0:
-      return jsonify(res)
-    # BEGIN SOLUTION
-
-    # END SOLUTION
-    return jsonify(res)
+    pass
+    # res = []
+    # query = request.args.get('query', '')
+    # if len(query) == 0:
+    #   return jsonify(res)
+    # # BEGIN SOLUTION
+    #
+    # # END SOLUTION
+    # return jsonify(res)
 
 @app.route("/search_anchor")
 def search_anchor():
@@ -120,14 +127,15 @@ def search_anchor():
         list of ALL (not just top 100) search results, ordered from best to 
         worst where each element is a tuple (wiki_id, title).
     '''
-    res = []
-    query = request.args.get('query', '')
-    if len(query) == 0:
-      return jsonify(res)
-    # BEGIN SOLUTION
-    
-    # END SOLUTION
-    return jsonify(res)
+    pass
+    # res = []
+    # query = request.args.get('query', '')
+    # if len(query) == 0:
+    #   return jsonify(res)
+    # # BEGIN SOLUTION
+    #
+    # # END SOLUTION
+    # return jsonify(res)
 
 @app.route("/get_pagerank", methods=['POST'])
 def get_pagerank():
@@ -145,14 +153,15 @@ def get_pagerank():
         list of floats:
           list of PageRank scores that correrspond to the provided article IDs.
     '''
-    res = []
-    wiki_ids = request.get_json()
-    if len(wiki_ids) == 0:
-      return jsonify(res)
-    # BEGIN SOLUTION
-
-    # END SOLUTION
-    return jsonify(res)
+    pass
+    # res = []
+    # wiki_ids = request.get_json()
+    # if len(wiki_ids) == 0:
+    #   return jsonify(res)
+    # # BEGIN SOLUTION
+    #
+    # # END SOLUTION
+    # return jsonify(res)
 
 @app.route("/get_pageview", methods=['POST'])
 def get_pageview():
@@ -172,14 +181,15 @@ def get_pageview():
           list of page view numbers from August 2021 that correrspond to the 
           provided list article IDs.
     '''
-    res = []
-    wiki_ids = request.get_json()
-    if len(wiki_ids) == 0:
-      return jsonify(res)
-    # BEGIN SOLUTION
-
-    # END SOLUTION
-    return jsonify(res)
+    # res = []
+    # wiki_ids = request.get_json()
+    # if len(wiki_ids) == 0:
+    #   return jsonify(res)
+    # # BEGIN SOLUTION
+    #
+    # # END SOLUTION
+    # return jsonify(res)
+    pass
 
 def run(**options):
     app.run(**options)

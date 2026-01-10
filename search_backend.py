@@ -7,11 +7,11 @@ from collections import Counter, defaultdict
 from contextlib import closing
 from functools import lru_cache
 from typing import Dict, List, Tuple, Iterable, Optional
-
 import numpy as np
 from google.cloud import storage
+from inverted_index_gcp import InvertedIndex
 
-from inverted_index_gcp import MultiFileReader
+
 
 # --- Minimal (embedded) English stopwords set (based on common NLTK list) ---
 # (No nltk.download needed)
@@ -46,53 +46,26 @@ BLOCK_SIZE = 1999998
 TUPLE_SIZE = 6
 
 
-class GCSMultiFileReader:
-    """
-    Reads byte ranges from multiple GCS objects given locs=[(file_name, offset), ...].
-    Handles cases where file_name already includes the base_dir prefix.
-    """
+bucket_name = "shay-208886382-bucket"
+file_path = "postings_gcp/index.pkl"
 
-    def __init__(self, bucket_name: str, base_dir: str):
-        self.bucket_name = bucket_name
-        self.base_dir = base_dir.strip("/")
+def load_index_from_gcp(bucket_name: str, file_path: str):
+    storage_client = storage.Client()
+    bucket = storage_client.bucket(bucket_name)
+    blob = bucket.blob(file_path)
+    contents = blob.download_as_bytes()
+    inverted = pickle.loads(contents)
+    return inverted
 
-        self._client = storage.Client()
-        self._bucket = self._client.bucket(bucket_name)
+# file_path = "doc_title_dic.pickle"
+def load_title_dict_from_gcp(bucket_name: str, file_path: str):
+    storage_client = storage.Client()
+    bucket = storage_client.bucket(bucket_name)
+    blob = bucket.blob(file_path)
+    contents = blob.download_as_bytes()
+    doc_title_dic = pickle.loads(contents)
+    return doc_title_dic
 
-    def _normalize_blob_name(self, f_name: str) -> str:
-        f_name = f_name.lstrip("/")
-        if self.base_dir == "":
-            return f_name
-        # If already starts with base_dir, don't double-prepend
-        if f_name.startswith(self.base_dir + "/") or f_name == self.base_dir:
-            return f_name
-        return f"{self.base_dir}/{f_name}"
-
-    def read(self, locs: Iterable[Tuple[str, int]], n_bytes: int) -> bytes:
-        chunks = []
-        remaining = n_bytes
-
-        for f_name, offset in locs:
-            if remaining <= 0:
-                break
-
-            blob_name = self._normalize_blob_name(str(f_name))
-            blob = self._bucket.blob(blob_name)
-
-            # staff logic: n_read = min(remaining, BLOCK_SIZE - offset)
-            n_read = min(remaining, BLOCK_SIZE - int(offset))
-            if n_read <= 0:
-                continue
-
-            # download byte range [start, end] inclusive
-            start = int(offset)
-            end = start + n_read - 1
-            data = blob.download_as_bytes(start=start, end=end)
-
-            chunks.append(data)
-            remaining -= len(data)
-
-        return b"".join(chunks)
 
 
 class SearchEngine:
@@ -107,8 +80,7 @@ class SearchEngine:
       - title_dict_pkl_path: "doc_title_dic.pickle"
     """
 
-    def __init__(
-        self,
+    def __init__(self,
         bucket_name: str,
         body_index_pkl_path: str = "postings_gcp/index.pkl",
         body_bins_folder: str = "postings_gcp",
@@ -121,175 +93,100 @@ class SearchEngine:
 
         self._storage_client = storage.Client()
 
-        # Load assets once (startup)
-        self.doc_title_dic = self._load_pickle_from_gcs(self.title_dict_pkl_path)
-        self.index_body = self._load_pickle_from_gcs(self.body_index_pkl_path)
-
-        # sanity checks
-        if not hasattr(self.index_body, "df") or not hasattr(self.index_body, "posting_locs"):
-            raise ValueError("Loaded body index object doesn't look like an inverted index (df/posting_locs missing).")
-        if not hasattr(self.index_body, "N"):
-            raise ValueError("Loaded body index is missing attribute N (needed for IDF).")
-        if not hasattr(self.index_body, "weights"):
-            raise ValueError("Loaded body index is missing attribute weights (needed for doc_len/doc_norm).")
-
-        self._reader = GCSMultiFileReader(bucket_name=self.bucket_name, base_dir=self.body_bins_folder)
+        self.index_body = load_index_from_gcp(bucket_name, self.body_index_pkl_path)
+        self.doc_title_dic = load_title_dict_from_gcp(bucket_name, self.title_dict_pkl_path)
 
     # ------------------------- Public API -------------------------
-
-    def search(self, query: str, top_k: int = 100) -> List[Tuple[int, str]]:
-        if not query:
+    def search(self, query, top_k=100):
+        query_tokens = self._tokenize(query)
+        if not query_tokens:
             return []
 
-        tokens = self._tokenize(query)
-        if not tokens:
+        q_data = self._calc_query_tfidf(query_tokens, self.index_body)
+        if not q_data:
             return []
 
-        query_tfidf = self._calc_query_tfidf(tokens, self.index_body)
-        if not query_tfidf:
+        # query norm
+        q_norm = math.sqrt(sum(w_q * w_q for (w_q, _) in q_data.values()))
+        if q_norm == 0:
             return []
 
-        doc_numerators = self._get_candidate_docs_body(tokens, query_tfidf)
-        if not doc_numerators:
-            return []
+        scores = defaultdict(float)
 
-        scores = self._cosine_scores(doc_numerators, query_tfidf)
+        for term, (w_q, idf) in q_data.items():
+            posting = self._posting_list(term)  # [(doc_id, tf), ...]
+            if not posting:
+                continue
+
+            for doc_id, tf in posting:
+                w_d = tf * idf
+                scores[doc_id] += w_q * w_d
+
         if not scores:
             return []
 
-        top = sorted(scores.items(), key=lambda x: x[1], reverse=True)[:top_k]
+        ranked = sorted(
+            ((doc_id, score / q_norm) for doc_id, score in scores.items()),
+            key=lambda x: x[1],
+            reverse=True
+        )[:top_k]
 
-        res: List[Tuple[int, str]] = []
-        for doc_id, _score in top:
-            title = self.doc_title_dic.get(doc_id)
-            if title is not None:
-                res.append((int(doc_id), title))
+        return self.find_title_doc_id(ranked)
+
+    def find_title_doc_id(self, candidates):
+        res = []
+        for i, _ in candidates:
+            title = self.doc_title_dic.get(i)
+            if title is None:
+                title = ""  # שלא יחזור None
+            res.append((str(i), title))
         return res
 
-    # ------------------------- Tokenization -------------------------
-
-    def _tokenize(self, text: str) -> List[str]:
-        tokens = [m.group().lower() for m in RE_WORD.finditer(text)]
-        return [t for t in tokens if t not in ALL_STOPWORDS]
 
     # ------------------------- TF-IDF helpers -------------------------
 
-    def _calc_query_tfidf(self, query_tokens: List[str], index) -> Dict[str, float]:
+    def _calc_query_tfidf(self, query_tokens: List[str], index) -> Dict[str, Tuple[float, float]]:
         """
-        tfidf(q, t) = (tf / |q|) * log(N / df(t))
+        Returns dict:
+          term -> (w_q, idf)
+
+        w_q = (tf(term in query)/|q|) * idf
+        idf = log((N+1)/(df+1))
         """
         q_tf = Counter(query_tokens)
         q_len = len(query_tokens)
         if q_len == 0:
             return {}
 
-        N = index.N
-        q_weights: Dict[str, float] = {}
+        N = len(self.doc_title_dic) or 1  # corpus size
+        q_data = {}
 
-        for term in np.unique(query_tokens):
-            df = index.df.get(term)
-            if not df:
+        for term, tf in q_tf.items():
+            df = index.df.get(term, 0)
+            if df <= 0:
                 continue
-            q_weights[term] = (q_tf[term] / q_len) * math.log(N / df)
 
-        return q_weights
+            idf = math.log((N + 1) / (df + 1))  # smoothing
+            w_q = (tf / q_len) * idf
+            q_data[term] = (w_q, idf)
 
-    @lru_cache(maxsize=25000)
-    def _read_posting_list(self, index, term: str) -> List[Tuple[int, int]]:
-        """
-        Reads posting list from GCS bins folder (self.body_bins_folder).
-        Each posting entry encoded as 6 bytes: 4 bytes doc_id, 2 bytes tf.
-        """
-        if term not in index.posting_locs:
+        return q_data
+
+    def _tokenize(self, text: str):
+        tokens = [m.group() for m in RE_WORD.finditer(text.lower())]
+        return [t for t in tokens if t not in ALL_STOPWORDS]
+
+    def _posting_list(self, term: str):
+        pl = self.index_body.read_a_posting_list(self.body_bins_folder, term, self.bucket_name)
+        if pl:
+            return pl
+
+        locs = getattr(self.index_body, "posting_locs", {}).get(term, [])
+        if not locs:
             return []
 
-        df = index.df.get(term, 0)
-        if df == 0:
-            return []
+        first_fname = locs[0][0]
+        if isinstance(first_fname, str) and first_fname.startswith(self.body_bins_folder.rstrip("/") + "/"):
+            return self.index_body.read_a_posting_list("", term, self.bucket_name)
 
-        locs = index.posting_locs[term]
-        b = self._reader.read(locs, df * TUPLE_SIZE)  # TUPLE_SIZE=6
-
-        posting_list: List[Tuple[int, int]] = []
-        for i in range(df):
-            doc_id = int.from_bytes(b[i * 6:i * 6 + 4], "big")
-            tf = int.from_bytes(b[i * 6 + 4:(i + 1) * 6], "big")
-            posting_list.append((doc_id, tf))
-
-        return posting_list
-
-    def _get_candidate_docs_body(self, query_tokens: List[str], query_tfidf: Dict[str, float]) -> Dict[int, float]:
-        """
-        Builds dot-product numerator for cosine similarity:
-            numerator(doc) += (tf/doc_len) * idf * q_tfidf(term)
-
-        Assumes index.weights[doc_id][0] = doc_len
-                index.weights[doc_id][1] = doc_norm_sq   (or similar)
-        """
-        index = self.index_body
-        N = index.N
-
-        numerators: Dict[int, float] = defaultdict(float)
-
-        for term in np.unique(query_tokens):
-            df = index.df.get(term)
-            if not df:
-                continue
-
-            q_w = query_tfidf.get(term)
-            if q_w is None:
-                continue
-
-            idf = math.log(N / df)
-            posting_list = self._read_posting_list(self.index_body, term)
-            if not posting_list:
-                continue
-
-            for doc_id, tf in posting_list:
-                try:
-                    doc_len = index.weights[doc_id][0]
-                except Exception:
-                    continue
-                if not doc_len:
-                    continue
-
-                numerators[doc_id] += (tf / doc_len) * idf * q_w
-
-        return numerators
-
-    def _cosine_scores(self, numerators: Dict[int, float], query_tfidf: Dict[str, float]) -> Dict[int, float]:
-        """
-        cosine(doc, q) = numerator / (||doc|| * ||q||)
-        where doc norm squared is assumed available at index.weights[doc_id][1]
-        """
-        index = self.index_body
-
-        q_norm_sq = sum(w * w for w in query_tfidf.values())
-        if q_norm_sq == 0:
-            return {}
-        q_norm = math.sqrt(q_norm_sq)
-
-        scores: Dict[int, float] = {}
-        for doc_id, num in numerators.items():
-            try:
-                doc_norm_sq = index.weights[doc_id][1]
-            except Exception:
-                continue
-            if not doc_norm_sq:
-                continue
-
-            denom = math.sqrt(doc_norm_sq) * q_norm
-            if denom == 0:
-                continue
-
-            scores[doc_id] = num / denom
-
-        return scores
-
-    # ------------------------- GCS helpers -------------------------
-
-    def _load_pickle_from_gcs(self, blob_path: str):
-        bucket = self._storage_client.bucket(self.bucket_name)
-        blob = bucket.blob(blob_path)
-        data = blob.download_as_bytes()
-        return pickle.loads(data)
+        return []
