@@ -13,7 +13,6 @@ app.config['JSONIFY_PRETTYPRINT_REGULAR'] = False
 bucket_name = "shay-208886382-bucket"
 file_path = "postings_gcp/index.pkl"
 
-#TODO: update our parameters from GCP bucket
 engine = SearchEngine(
     bucket_name=bucket_name,
     body_index_pkl_path=file_path,
