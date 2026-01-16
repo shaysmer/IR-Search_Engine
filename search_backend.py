@@ -165,9 +165,9 @@ class SearchEngine:
           - "cosine": full cosine (doc norm approximated using query terms)
         """
         if scorer == "tfidf":
-            return self.search_tfidf(query, top_k=top_k)
+            return self.search_tfidf(query.lower(), top_k=top_k)
         elif scorer == "cosine":
-            return self.search_cosine(query, top_k=top_k)
+            return self.search_cosine(query.lower(), top_k=top_k)
         else:
             raise ValueError(f"Unknown scorer='{scorer}'. Use 'tfidf' or 'cosine'.")
 
