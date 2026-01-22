@@ -158,18 +158,63 @@ class SearchEngine:
     # Public API
     # =============================================================================
 
-    def search(self, query, top_k=100,scorer="tfidf"):
+    def search(self, query, top_k=100):
         """
-        scorer:
-          - "tfidf": your current query-normalized dot product
-          - "cosine": full cosine (doc norm approximated using query terms)
-        """
-        if scorer == "tfidf":
-            return self.search_tfidf(query.lower(), top_k=top_k)
-        elif scorer == "cosine":
-            return self.search_cosine(query.lower(), top_k=top_k)
-        else:
-            raise ValueError(f"Unknown scorer='{scorer}'. Use 'tfidf' or 'cosine'.")
+                Search for a query string over the BODY index using TF-IDF weighted scoring.
+
+                Parameters
+                ----------
+                query : str
+                    Raw query string provided by the user.
+                top_k : int
+                    Maximum number of results to return.
+
+                Returns
+                -------
+                List[Tuple[str, str]]
+                    A list of (wiki_id_as_str, title) pairs ordered by score descending.
+                """
+        # Tokenize query; if empty after stopword removal, return no results
+        query_tokens = self._tokenize(query)
+        if not query_tokens:
+            return []
+
+        # Compute query tf-idf weights and term idf values (term -> (w_q, idf))
+        q_data = self._calc_query_tfidf(query_tokens, self.index_body)
+        if not q_data:
+            return []
+
+        # query norm
+        q_norm = math.sqrt(sum(w_q * w_q for (w_q, _) in q_data.values()))
+        if q_norm == 0:
+            return []
+
+        # Accumulate dot-product scores per document
+        scores = defaultdict(float)
+
+        for term, (w_q, idf) in q_data.items():
+            # Load posting list for this term: [(doc_id, tf), ...]
+            posting = self._posting_list(term)
+            if not posting:
+                continue
+
+            # For each doc: w_d = tf * idf (standard tf-idf for document)
+            # Add to dot product with query vector
+            for doc_id, tf in posting:
+                w_d = tf * idf
+                scores[doc_id] += w_q * w_d
+
+        if not scores:
+            return []
+
+        # Rank by normalized score (normalize only by query norm, not document norm)
+        ranked = sorted(
+            ((doc_id, score / q_norm) for doc_id, score in scores.items()),
+            key=lambda x: x[1],
+            reverse=True
+        )[:top_k]
+
+        return self.find_title_doc_id(ranked)
 
     def find_title_doc_id(self, candidates):
         """
@@ -292,89 +337,3 @@ class SearchEngine:
             return self.index_body.read_a_posting_list("", term, self.bucket_name)
 
         return []
-
-    def search_tfidf(self, query, top_k=100):
-        """Your original implementation (normalize only by query norm)."""
-        query_tokens = self._tokenize(query)
-        if not query_tokens:
-            return []
-
-        q_data = self._calc_query_tfidf(query_tokens, self.index_body)
-        if not q_data:
-            return []
-
-        q_norm = math.sqrt(sum(w_q * w_q for (w_q, _) in q_data.values()))
-        if q_norm == 0:
-            return []
-
-        scores = defaultdict(float)
-
-        for term, (w_q, idf) in q_data.items():
-            posting = self._posting_list(term)
-            if not posting:
-                continue
-            for doc_id, tf in posting:
-                w_d = tf * idf
-                scores[doc_id] += w_q * w_d
-
-        if not scores:
-            return []
-
-        ranked = sorted(
-            ((doc_id, score / q_norm) for doc_id, score in scores.items()),
-            key=lambda x: x[1],
-            reverse=True
-        )[:top_k]
-
-        return self.find_title_doc_id(ranked)
-
-    def search_cosine(self, query, top_k=100):
-        """
-        Full cosine similarity:
-            cosine(d,q) = dot(d,q) / (||q|| * ||d||)
-
-        Here ||d|| is approximated using ONLY the query terms:
-            ||d|| ≈ sqrt(sum_{t in q} (tf_{t,d} * idf(t))^2)
-
-        This avoids precomputing doc norms and usually improves ranking quality.
-        """
-        query_tokens = self._tokenize(query)
-        if not query_tokens:
-            return []
-
-        q_data = self._calc_query_tfidf(query_tokens, self.index_body)
-        if not q_data:
-            return []
-
-        q_norm = math.sqrt(sum(w_q * w_q for (w_q, _) in q_data.values()))
-        if q_norm == 0:
-            return []
-
-        scores = defaultdict(float)
-        doc_norm_sq = defaultdict(float)  # accumulate ||d||^2 (approx)
-
-        for term, (w_q, idf) in q_data.items():
-            posting = self._posting_list(term)
-            if not posting:
-                continue
-
-            for doc_id, tf in posting:
-                w_d = tf * idf
-                scores[doc_id] += w_q * w_d
-                doc_norm_sq[doc_id] += w_d * w_d
-
-        if not scores:
-            return []
-
-        # normalize by (||q|| * ||d||)
-        ranked = []
-        for doc_id, dot in scores.items():
-            d_norm = math.sqrt(doc_norm_sq.get(doc_id, 0.0))
-            if d_norm == 0:
-                continue
-            ranked.append((doc_id, dot / (q_norm * d_norm)))
-
-        ranked.sort(key=lambda x: x[1], reverse=True)
-        ranked = ranked[:top_k]
-
-        return self.find_title_doc_id(ranked)
